@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/av-scanners-logo.png" alt="ENiGMA½ AV Scanners" width="480">
+</p>
+
 # ENiGMA½ AV Scanners
 
 Two file scanners for [ENiGMA½ BBS](https://github.com/NuSkooler/enigma-bbs)'s
