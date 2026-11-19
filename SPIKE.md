@@ -7,7 +7,7 @@ local clamd 1.5.4 (`/var/run/clamav/clamd.ctl`).
 
 ## Decision
 
-**Hand-roll the client** (`lib/clamd.js`, about 200 lines with comments). `clamscan`
+**Hand-roll the client** (`lib/clamd.js`: about 270 lines, 190 without comments). `clamscan`
 is not used.
 
 The owner's preference for an upstream-maintained dependency (decision 11) assumes
@@ -95,7 +95,7 @@ The protocol is small and stable (unchanged since INSTREAM appeared in 0.95):
   `<text> ERROR`.
 
 `PING` -> `PONG` is the health check. `VERSION` may be disabled (`COMMAND
-UNAVAILABLE` on this box). A client that does what we need is under 200 lines:
+UNAVAILABLE` on this box). A client that does what we need is about 190 lines of code:
 backpressure (`pause` on a full write, `resume` on `drain`), an `AbortSignal` that
 destroys both streams, a single-callback guard, a capped reply buffer, strict reply
 parsing where anything unrecognised is an error, and early-reply handling (clamd
