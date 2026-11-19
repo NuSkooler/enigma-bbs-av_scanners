@@ -270,7 +270,7 @@ describe('virustotal scanner', function () {
 
         it('after a 429, stops asking until Retry-After has passed', async () => {
             let t = 1_000_000;
-            const s = make({ now: () => t });
+            const s = make({ monoNow: () => t });
             const h = sha('quota');
             fake.json(h, 429, {}, { 'retry-after': '30' });
             assert.strictEqual((await scan(s, h)).result, 'error');
@@ -284,6 +284,79 @@ describe('virustotal scanner', function () {
             t += 31 * 1000;
             assert.strictEqual((await scan(s, sha('quota-3'))).result, 'skipped');
             assert.strictEqual(fake.requests.length, 2);
+        });
+
+        it('a 429 fails the lookups already waiting, without sending them', async () => {
+            const s = make({ windowMs: 300 });
+            fake.routes.clear();
+            const statusFor = () => (req, res) => {
+                res.writeHead(429, { 'retry-after': '3600' });
+                res.end();
+            };
+            const hashes = [1, 2, 3, 4].map(i => sha(`q429-${i}`));
+            hashes.forEach(h => fake.routes.set(h, statusFor()));
+            const opts = options({ requestsPerMinute: 1, cacheMinutes: 0 });
+            const results = await Promise.all(hashes.map(h => scan(s, h, opts)));
+            results.forEach(r => {
+                assert.strictEqual(r.result, 'error');
+                assert.match(r.detail, /Quota exceeded \(HTTP 429\)/);
+            });
+            assert.strictEqual(fake.requests.length, 1);
+            assert.strictEqual([...s._states.values()][0].waiting.length, 0);
+        });
+
+        it('reads a Retry-After HTTP-date, and caps any Retry-After at an hour', async () => {
+            const wall = Date.parse('2026-11-18T12:00:00Z');
+            const cases = [
+                [new Date(wall + 120 * 1000).toUTCString(), /for 120s/],
+                ['Wed, 18 Nov 2026 11:00:00 GMT', /for 60s/], //  in the past
+                ['soon', /for 60s/],
+                ['999999999', /for 3600s/],
+                [new Date(wall + 10 * 3600 * 1000).toUTCString(), /for 3600s/],
+            ];
+            for (const [header, re] of cases) {
+                const s = make({ now: () => wall });
+                const h = sha(`ra-${header}`);
+                fake.json(h, 429, {}, { 'retry-after': header });
+                await scan(s, h);
+                const again = await scan(s, sha(`ra2-${header}`));
+                assert.match(again.detail, re, header);
+            }
+        });
+
+        [
+            ['a count as a string', { malicious: '60', undetected: 5 }],
+            ['a missing count', { undetected: 70, suspicious: 0, harmless: 0 }],
+            ['a fractional count', { malicious: 60.5 }],
+            ['a negative count', { malicious: -1 }],
+            ['a count that is null', { harmless: null }],
+        ].forEach(([what, override]) => {
+            it(`a report with ${what} is an error, not clean`, async () => {
+                const h = sha(`stats-${what}`);
+                const body = report({});
+                const stats = body.data.attributes.last_analysis_stats;
+                Object.assign(stats, override);
+                Object.keys(override).forEach(k => {
+                    if (undefined === override[k]) {
+                        delete stats[k];
+                    }
+                });
+                if (!('malicious' in override) && 'a missing count' === what) {
+                    delete stats.malicious;
+                }
+                fake.json(h, 200, body);
+                const res = await scan(make(), h);
+                assert.strictEqual(res.result, 'error', JSON.stringify(res));
+                assert.match(res.detail, /Malformed response/);
+            });
+        });
+
+        it('last_analysis_stats that is an array is an error', async () => {
+            const h = sha('stats-array');
+            fake.json(h, 200, { data: { attributes: { last_analysis_stats: [] } } });
+            const res = await scan(make(), h);
+            assert.strictEqual(res.result, 'error');
+            assert.match(res.detail, /no last_analysis_stats/);
         });
 
         it('malformed JSON is an error', async () => {
@@ -430,7 +503,7 @@ describe('virustotal scanner', function () {
 
         it('a lookup waiting for the rate limit stops on abort', async () => {
             const s = make({ windowMs: 5000 });
-            const opts = options({ requestsPerMinute: 1 });
+            const opts = options({ requestsPerMinute: 1, maxWaitMs: 10000 });
             await scan(s, sha('w-1'), opts);
             const ac = new AbortController();
             setTimeout(() => ac.abort(), 100);
@@ -454,6 +527,191 @@ describe('virustotal scanner', function () {
                 ['skipped', 'skipped', 'error']
             );
             assert.match(results[2].detail, /Too many lookups waiting/);
+        });
+
+        it('maxQueue 0 only refuses lookups that would have to wait', async () => {
+            const s = make({ windowMs: 500 });
+            const opts = options({ requestsPerMinute: 1, maxQueue: 0 });
+            assert.strictEqual((await scan(s, sha('mq0-1'), opts)).result, 'skipped');
+            const second = await scan(s, sha('mq0-2'), opts);
+            assert.strictEqual(second.result, 'error');
+            assert.match(
+                second.detail,
+                /Too many lookups waiting for the rate limit \(0\)/
+            );
+            assert.strictEqual(fake.requests.length, 1);
+        });
+
+        it('waits at most maxWaitMs for a slot (default 2 s), then is an error', async () => {
+            assert.strictEqual(virustotal.DEFAULTS.maxWaitMs, 2000);
+            //  the window would free a slot in 1 s: within reach of 2 s, not 150 ms
+            const s = make({ windowMs: 1000 });
+            const opts = options({ requestsPerMinute: 1, cacheMinutes: 0 });
+            await scan(s, sha('mw-1'), opts);
+
+            let t0 = Date.now();
+            const waited = await scan(s, sha('mw-2'), opts);
+            assert.strictEqual(waited.result, 'skipped');
+            assert.ok(Date.now() - t0 >= 900, `${Date.now() - t0}ms`);
+
+            t0 = Date.now();
+            const short = await scan(
+                s,
+                sha('mw-3'),
+                options({ requestsPerMinute: 1, maxWaitMs: 150 })
+            );
+            assert.strictEqual(short.result, 'error');
+            assert.match(short.detail, /more than maxWaitMs \(150ms\) away/);
+            assert.ok(Date.now() - t0 < 100, 'did not fail at once');
+        });
+
+        it('a slot further off than maxWaitMs fails at once, not after waiting', async () => {
+            //  a real minute: a lookup that waited would hold a core scan slot
+            const s = make({ windowMs: 60 * 1000 });
+            const opts = options({ requestsPerMinute: 1 });
+            await scan(s, sha('far-1'), opts);
+            const t0 = Date.now();
+            const res = await scan(s, sha('far-2'), opts);
+            assert.strictEqual(res.result, 'error');
+            assert.match(res.detail, /Rate limit reached \(1\/min\)/);
+            assert.ok(Date.now() - t0 < 100, `${Date.now() - t0}ms`);
+            assert.strictEqual(fake.requests.length, 1);
+        });
+
+        it('queues a lookup whose slot is within maxWaitMs, refuses one beyond it', async () => {
+            const s = make({ windowMs: 400 });
+            const opts = options({ requestsPerMinute: 1, maxWaitMs: 300 });
+            await scan(s, sha('mwb-1'), opts);
+            await new Promise(r => setTimeout(r, 150)); //  slot due in ~250 ms
+            const t0 = Date.now();
+            const results = await Promise.all([
+                scan(s, sha('mwb-2'), opts), //  ~250 ms: waits
+                scan(s, sha('mwb-3'), opts), //  ~650 ms: refused at once
+            ]);
+            assert.strictEqual(results[0].result, 'skipped');
+            assert.strictEqual(results[1].result, 'error');
+            assert.ok(Date.now() - t0 < 500, `${Date.now() - t0}ms`);
+        });
+
+        it('maxWaitMs bounds the wait even when the slot does not come', async () => {
+            //  a stopped monotonic clock: the window never rolls
+            const s = make({ windowMs: 100, monoNow: () => 42 });
+            const opts = options({ requestsPerMinute: 1, maxWaitMs: 200 });
+            await scan(s, sha('stuck-1'), opts);
+            const t0 = Date.now();
+            const res = await scan(s, sha('stuck-2'), opts);
+            assert.strictEqual(res.result, 'error');
+            assert.match(res.detail, /No lookup slot came free within 200ms/);
+            assert.ok(Date.now() - t0 >= 190, `${Date.now() - t0}ms`);
+            assert.strictEqual([...s._states.values()][0].waiting.length, 0);
+        });
+
+        it('maxWaitMs 0 never waits', async () => {
+            const s = make({ windowMs: 200 });
+            const opts = options({ requestsPerMinute: 1, maxWaitMs: 0 });
+            await scan(s, sha('mw0-1'), opts);
+            const res = await scan(s, sha('mw0-2'), opts);
+            assert.strictEqual(res.result, 'error');
+            assert.match(res.detail, /maxWaitMs is 0/);
+        });
+
+        it('concurrent lookups of one hash share a request', async () => {
+            const s = make();
+            const h = sha('dup');
+            fake.json(h, 200, report({ malicious: 3, undetected: 60 }));
+            const results = await Promise.all([
+                scan(s, h),
+                scan(s, h, options({ minDetections: 5 })),
+                scan(s, h),
+            ]);
+            assert.strictEqual(fake.requests.length, 1);
+            //  each with its own entry's threshold
+            assert.deepStrictEqual(
+                results.map(r => r.result),
+                ['infected', 'clean', 'infected']
+            );
+        });
+
+        it('a shared lookup that fails fails every scan waiting on it', async () => {
+            const s = make();
+            const h = sha('dup-err');
+            fake.json(h, 503, {});
+            const results = await Promise.all([scan(s, h), scan(s, h), scan(s, h)]);
+            assert.strictEqual(fake.requests.length, 1);
+            results.forEach(r => assert.match(r.detail, /unavailable \(HTTP 503\)/));
+        });
+
+        it('one scan aborting leaves a shared lookup running for the others', async () => {
+            const s = make();
+            const h = sha('dup-abort');
+            let release;
+            fake.routes.set(h, (req, res) => {
+                release = () => {
+                    res.writeHead(200, { 'content-type': 'application/json' });
+                    res.end(JSON.stringify(report({ malicious: 0 })));
+                };
+            });
+            const ac = new AbortController();
+            const first = scan(s, h, options(), { abortSignal: ac.signal });
+            const second = scan(s, h);
+            await new Promise(r => setTimeout(r, 100));
+            ac.abort();
+            const aborted = await first;
+            assert.strictEqual(aborted.result, 'error');
+            assert.match(aborted.detail, /Aborted/);
+            release();
+            assert.strictEqual((await second).result, 'clean');
+            assert.strictEqual(fake.requests.length, 1);
+        });
+
+        it('the request stops once every scan sharing it has aborted', async () => {
+            const s = make();
+            const h = sha('dup-all-abort');
+            let closed = false;
+            fake.routes.set(h, req => req.socket.on('close', () => (closed = true)));
+            const ac = new AbortController();
+            const both = Promise.all([
+                scan(s, h, options(), { abortSignal: ac.signal }),
+                scan(s, h, options(), { abortSignal: ac.signal }),
+            ]);
+            await new Promise(r => setTimeout(r, 100));
+            ac.abort();
+            (await both).forEach(r => assert.strictEqual(r.result, 'error'));
+            await new Promise(r => setTimeout(r, 100));
+            assert.strictEqual(closed, true);
+            assert.strictEqual([...s._states.values()][0].inflight.size, 0);
+        });
+
+        it('the rate window runs on the monotonic clock, not the wall clock', async () => {
+            let wall = Date.parse('2026-11-18T12:00:00Z');
+            let mono = 1000;
+            const s = make({ now: () => wall, monoNow: () => mono, windowMs: 60000 });
+            const opts = options({ requestsPerMinute: 1, maxWaitMs: 0, cacheMinutes: 0 });
+            await scan(s, sha('mono-1'), opts);
+            wall += 3600 * 1000; //  the wall clock jumps an hour ahead
+            assert.strictEqual((await scan(s, sha('mono-2'), opts)).result, 'error');
+            mono += 60001;
+            assert.strictEqual((await scan(s, sha('mono-3'), opts)).result, 'skipped');
+        });
+
+        it('a backwards clock step neither resets the day count again nor stalls it', async () => {
+            let wall = Date.parse('2026-11-19T00:00:30Z');
+            let mono = 0;
+            const s = make({ now: () => wall, monoNow: () => mono, windowMs: 1 });
+            const opts = options({ dailyLimit: 1, cacheMinutes: 0 });
+            const step = () => (mono += 10);
+            assert.strictEqual((await scan(s, sha('bk-1'), opts)).result, 'skipped');
+            step();
+            wall = Date.parse('2026-11-18T23:59:50Z'); //  stepped back over midnight
+            assert.match((await scan(s, sha('bk-2'), opts)).detail, /Daily lookup limit/);
+            step();
+            wall = Date.parse('2026-11-19T00:00:40Z'); //  and forward again
+            assert.match((await scan(s, sha('bk-3'), opts)).detail, /Daily lookup limit/);
+            //  a clock stuck far behind: a new day after 24 h of real time
+            wall = Date.parse('2026-11-01T00:00:00Z');
+            mono += 24 * 3600 * 1000;
+            assert.strictEqual((await scan(s, sha('bk-4'), opts)).result, 'skipped');
+            assert.strictEqual(fake.requests.length, 2);
         });
 
         it('the daily limit turns lookups into errors until 00:00 UTC', async () => {
@@ -501,7 +759,7 @@ describe('virustotal scanner', function () {
 
         it('expires entries after cacheMinutes, and can be turned off', async () => {
             let t = 5_000_000;
-            const s = make({ now: () => t, windowMs: 1 });
+            const s = make({ monoNow: () => t, windowMs: 1 });
             const h = sha('ttl');
             await scan(s, h, options({ cacheMinutes: 1 }));
             t += 30 * 1000;
@@ -541,6 +799,47 @@ describe('virustotal scanner', function () {
                 assert.strictEqual(fake.requests.length, 0);
                 done();
             });
+        });
+
+        it('warns about invalid and implausible options, keeping strict defaults', done => {
+            make().init(
+                [
+                    options({
+                        minDetections: 0,
+                        requestsPerMinute: -4,
+                        maxWaitMs: 'soon',
+                        countSuspicious: 'yes',
+                    }),
+                    options({ minDetections: 200 }),
+                    options({ minDetections: true }),
+                ],
+                err => {
+                    assert.ok(err);
+                    const m = err.message;
+                    assert.match(
+                        m,
+                        /entry 1: "minDetections" must be a number of at least 1; using 2/
+                    );
+                    assert.match(m, /entry 1: "requestsPerMinute" must be .* using 4/);
+                    assert.match(m, /entry 1: "maxWaitMs" must be .* using 2000/);
+                    assert.match(m, /entry 1: "countSuspicious" must be true or false/);
+                    assert.match(m, /entry 2: "minDetections" is 200/);
+                    assert.match(m, /entry 3: "minDetections" must be/);
+                    done();
+                }
+            );
+        });
+
+        it('falls back to the strict default for a bad minDetections', async () => {
+            const h = sha('min0');
+            fake.json(h, 200, report({ malicious: 1, undetected: 60 }));
+            for (const minDetections of [0, -1, 'x', true]) {
+                const res = await scan(make(), h, options({ minDetections }));
+                assert.strictEqual(res.result, 'clean', String(minDetections));
+            }
+            fake.json(h, 200, report({ malicious: 2, undetected: 60 }));
+            const res = await scan(make(), h, options({ minDetections: 0 }));
+            assert.strictEqual(res.result, 'infected');
         });
 
         it('is request-free with good keys', done => {
