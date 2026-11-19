@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 
 const clamav = require('../lib/clamav.js');
-const { eicar, storedZip } = require('./helpers/eicar.js');
+const { eicar, storedZip, EICAR_SHA256 } = require('./helpers/eicar.js');
 
 const SOCKET = process.env.CLAMD_SOCKET || '/var/run/clamav/clamd.ctl';
 
@@ -43,20 +43,25 @@ function streamMaxLength() {
     return Number(m[1]) * unit;
 }
 
-function scan(filePath) {
+function scan(filePath, ctxExtra = {}) {
     return new Promise((resolve, reject) => {
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), 30000);
-        clamav
-            .createClamAvScanner()
-            .scan(
-                filePath,
-                { options: { socket: SOCKET }, abortSignal: ac.signal, timeout: 30000 },
-                (err, res) => {
-                    clearTimeout(timer);
-                    return err ? reject(err) : resolve(res);
-                }
-            );
+        clamav.createClamAvScanner().scan(
+            filePath,
+            Object.assign(
+                {
+                    options: { socket: SOCKET },
+                    abortSignal: ac.signal,
+                    timeout: 30000,
+                },
+                ctxExtra
+            ),
+            (err, res) => {
+                clearTimeout(timer);
+                return err ? reject(err) : resolve(res);
+            }
+        );
     });
 }
 
@@ -98,6 +103,27 @@ describe('clamav against a real clamd', function () {
             assert.strictEqual(res.result, 'infected', JSON.stringify(res));
             assert.match(res.signature, /Eicar/i);
         });
+    });
+
+    it("finds EICAR with core's SHA-256 of the file passed along", async () => {
+        const res = await scan(path.join(dir, 'eicar.com'), { sha256: EICAR_SHA256 });
+        assert.strictEqual(res.result, 'infected', JSON.stringify(res));
+    });
+
+    it('auto-detects the socket when none is configured', async function () {
+        if (SOCKET !== clamav.DEFAULT_SOCKET_PATHS[0]) {
+            this.skip();
+        }
+        const res = await new Promise(resolve =>
+            clamav
+                .createClamAvScanner()
+                .scan(
+                    path.join(dir, 'eicar.com'),
+                    { options: {}, timeout: 30000 },
+                    (e, r) => resolve(r)
+                )
+        );
+        assert.strictEqual(res.result, 'infected', JSON.stringify(res));
     });
 
     it('passes a clean text file', async () => {

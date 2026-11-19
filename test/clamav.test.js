@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const net = require('net');
+const { execFile } = require('child_process');
 
 const clamd = require('../lib/clamd.js');
 const clamav = require('../lib/clamav.js');
@@ -91,6 +92,45 @@ describe('clamd protocol helpers', () => {
     });
 });
 
+describe('clamd reply hardening', () => {
+    it('does not treat non-ASCII whitespace as padding', () => {
+        assert.strictEqual(clamd.parseScanReply('stream: OK\u00a0').result, 'error');
+        assert.strictEqual(clamd.parseScanReply('\u00a0stream: OK').result, 'error');
+        assert.strictEqual(clamd.parseScanReply('stream: OK\r\n').result, 'clean');
+    });
+
+    it('does not take "stream: OK" sent before the whole file was', async function () {
+        this.timeout(20000);
+        const dir = tempDir();
+        const big = path.join(dir, 'big.bin');
+        fs.closeSync(fs.openSync(big, 'w'));
+        fs.truncateSync(big, 64 * 1024 * 1024); //  sparse
+        //  answers OK at once, then stops reading: the client never gets to
+        //  the end of the file
+        const conns = new Set();
+        const server = net.createServer(s => {
+            conns.add(s);
+            s.on('error', () => {});
+            s.once('data', () => {
+                s.write('stream: OK\0');
+                s.pause();
+            });
+        });
+        await new Promise(r => server.listen(path.join(dir, 'early.sock'), r));
+        try {
+            const res = await scanWith({ socket: path.join(dir, 'early.sock') }, big, {
+                timeout: 5000,
+            });
+            assert.strictEqual(res.result, 'error');
+            assert.match(res.detail, /answered OK before the whole file was sent/);
+        } finally {
+            conns.forEach(c => c.destroy());
+            await new Promise(r => server.close(r));
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    });
+});
+
 describe('clamav target resolution', () => {
     it('uses an explicit socket', () => {
         assert.deepStrictEqual(clamav.resolveTarget({ socket: '/x/clamd.sock' }), {
@@ -115,12 +155,13 @@ describe('clamav target resolution', () => {
         assert.ok(clamav.resolveTarget({ port: 'abc' }).error);
     });
 
-    it('defaults to TCP 127.0.0.1:3310 on Windows', () => {
+    it('on Windows, needs host/port: TCP is never assumed', () => {
         const r = clamav.resolveTarget({}, { platform: 'win32', isSocket: () => true });
-        assert.deepStrictEqual(r.target, { host: '127.0.0.1', port: 3310 });
+        assert.strictEqual(r.target, undefined);
+        assert.match(r.error, /on Windows, set "host" and "port"/);
     });
 
-    it('elsewhere, takes the first default socket that exists, else TCP', () => {
+    it('elsewhere, takes the first trusted default socket, else is an error', () => {
         const r = clamav.resolveTarget(
             {},
             {
@@ -134,7 +175,127 @@ describe('clamav target resolution', () => {
             {},
             { platform: 'freebsd', isSocket: () => false }
         );
-        assert.deepStrictEqual(none.target, { host: '127.0.0.1', port: 3310 });
+        assert.strictEqual(none.target, undefined);
+        assert.match(none.error, /No clamd socket found at .*; set "socket"/);
+    });
+});
+
+describe('clamav: no implicit TCP fallback (squatting 127.0.0.1:3310)', () => {
+    let dir;
+    let file;
+
+    before(() => {
+        dir = tempDir();
+        file = path.join(dir, 'f.bin');
+        fs.writeFileSync(file, 'hello');
+    });
+
+    after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    it('does not connect to a listener on 3310 when no socket is found', async function () {
+        //  what any local user could do while clamd is absent or restarting
+        const connections = [];
+        const squat = net.createServer(s => {
+            connections.push(s);
+            s.on('error', () => {});
+            s.on('data', d => {
+                if (d.includes(Buffer.from([0, 0, 0, 0]))) {
+                    s.end('stream: OK\0');
+                }
+            });
+        });
+        const listening = await new Promise(resolve => {
+            squat.once('error', () => resolve(false));
+            squat.listen(clamav.DEFAULT_PORT, '127.0.0.1', () => resolve(true));
+        });
+        if (!listening) {
+            this.skip(); //  3310 is taken (a real clamd on TCP?)
+        }
+        try {
+            const scanner = clamav.createClamAvScanner({
+                socketPaths: [path.join(dir, 'not-here.ctl')],
+            });
+            const res = await new Promise(resolve =>
+                scanner.scan(file, { options: {}, timeout: 2000 }, (err, r) => resolve(r))
+            );
+            assert.strictEqual(res.result, 'error');
+            assert.match(res.detail, /No clamd socket found/);
+            await new Promise(r => setTimeout(r, 50));
+            assert.strictEqual(connections.length, 0, 'connected to the squatter');
+        } finally {
+            await new Promise(r => squat.close(r));
+        }
+    });
+
+    it('on Windows, with no host/port, scans are errors without connecting', async () => {
+        const scanner = clamav.createClamAvScanner({ platform: 'win32' });
+        const res = await new Promise(resolve =>
+            scanner.scan(file, { options: {}, timeout: 2000 }, (err, r) => resolve(r))
+        );
+        assert.strictEqual(res.result, 'error');
+        assert.match(res.detail, /on Windows/);
+    });
+
+    it('init says so, clearly, when no clamd is configured or found', done => {
+        clamav
+            .createClamAvScanner({ socketPaths: [path.join(dir, 'none.ctl')] })
+            .init([{ scanner: 'clamav' }, { scanner: 'clamav' }], err => {
+                assert.ok(err);
+                assert.match(err.message, /^clamav: No clamd socket found at /);
+                //  once, not once per entry
+                assert.strictEqual(err.message.split('No clamd socket').length, 2);
+                done();
+            });
+    });
+});
+
+describe('clamav: which guessed sockets are trusted', () => {
+    let dir;
+    let server;
+
+    beforeEach(async () => {
+        dir = tempDir(); //  0700, ours
+        server = net.createServer(s => s.destroy());
+        await new Promise(r => server.listen(path.join(dir, 'clamd.sock'), r));
+    });
+
+    afterEach(async () => {
+        await new Promise(r => server.close(r));
+        fs.chmodSync(dir, 0o700);
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('trusts a socket in a directory only its owner can write to', () => {
+        assert.strictEqual(clamav.isTrustedSocket(path.join(dir, 'clamd.sock')), true);
+    });
+
+    it('does not trust one in a group- or world-writable directory', () => {
+        const sock = path.join(dir, 'clamd.sock');
+        fs.chmodSync(dir, 0o777);
+        assert.strictEqual(clamav.isTrustedSocket(sock), false);
+        fs.chmodSync(dir, 0o770);
+        assert.strictEqual(clamav.isTrustedSocket(sock), false);
+    });
+
+    it('does not trust a symlink placed in a writable directory', () => {
+        const open = path.join(dir, 'open');
+        fs.mkdirSync(open, 0o777);
+        fs.chmodSync(open, 0o777);
+        const link = path.join(open, 'clamd.ctl');
+        fs.symlinkSync(path.join(dir, 'clamd.sock'), link);
+        assert.strictEqual(clamav.isTrustedSocket(link), false);
+    });
+
+    it('does not trust a missing path or a plain file', () => {
+        assert.strictEqual(clamav.isTrustedSocket(path.join(dir, 'missing')), false);
+        fs.writeFileSync(path.join(dir, 'plain'), '');
+        assert.strictEqual(clamav.isTrustedSocket(path.join(dir, 'plain')), false);
+    });
+
+    it('finds a real default socket through the trust check', () => {
+        const sock = path.join(dir, 'clamd.sock');
+        const r = clamav.resolveTarget({}, { socketPaths: ['/nonexistent/x', sock] });
+        assert.deepStrictEqual(r.target, { path: sock });
     });
 });
 
@@ -266,6 +427,25 @@ describe('clamav target resolution', () => {
             const res = await scanWith(opts, small, { timeout: 150 });
             assert.strictEqual(res.result, 'error');
             assert.match(res.detail, /No reply within 150ms/);
+        });
+
+        it('checks the bytes sent against ctx.sha256 (any case), and passes', async () => {
+            const opts = await start(() => ({ reply: 'stream: OK' }));
+            const res = await scanWith(opts, small, {
+                sha256: sha256File(small).toUpperCase(),
+            });
+            assert.deepStrictEqual(res, { result: 'clean' });
+            assert.strictEqual(fake.sessions[0].terminated, true);
+        });
+
+        it('is an error, with the stream left unfinished, when the file changed after hashing', async () => {
+            const opts = await start(() => ({ reply: 'stream: OK' }));
+            //  what core hashed is not what is on disk by the time clamd reads
+            const res = await scanWith(opts, small, { sha256: sha256File(empty) });
+            assert.strictEqual(res.result, 'error');
+            assert.match(res.detail, /file changed while it was being scanned/);
+            await new Promise(r => setTimeout(r, 50));
+            assert.strictEqual(fake.sessions[0].terminated, false);
         });
 
         it('is an error when the file cannot be read', async () => {
@@ -443,6 +623,40 @@ describe('clamav init', () => {
                 done();
             });
         });
+    });
+
+    it('a hung clamd does not keep the process alive (oputil)', async function () {
+        this.timeout(10000);
+        //  accepts and never answers
+        const conns = new Set();
+        const hung = net.createServer(s => {
+            conns.add(s);
+            s.on('error', () => {});
+        });
+        await new Promise(r => hung.listen(path.join(dir, 'hung.sock'), r));
+        const script = [
+            `const c = require(${JSON.stringify(path.join(__dirname, '..', 'lib', 'clamav.js'))});`,
+            `c.createClamAvScanner().init([{ socket: ${JSON.stringify(
+                path.join(dir, 'hung.sock')
+            )} }], () => process.stdout.write('called back'));`,
+        ].join('\n');
+        const t0 = Date.now();
+        try {
+            const out = await new Promise((resolve, reject) =>
+                execFile(
+                    process.execPath,
+                    ['-e', script],
+                    { timeout: 8000 },
+                    (err, so) => (err ? reject(err) : resolve(so))
+                )
+            );
+            //  exits at once rather than after the 5 s PING timeout
+            assert.ok(Date.now() - t0 < 4000, `took ${Date.now() - t0}ms`);
+            assert.strictEqual(out, '');
+        } finally {
+            conns.forEach(c => c.destroy());
+            await new Promise(r => hung.close(r));
+        }
     });
 
     it('reports (does not throw) an unreachable clamd', async () => {
