@@ -13,8 +13,9 @@ REST uploads, TIC imports (including passthrough echoes) and `oputil fb scan
 --virus-scan`, before it opens or extracts anything.
 
 Requires an ENiGMA½ with file scanning and the `registerFileScanners` mod export
-(master from [#1114](https://github.com/NuSkooler/enigma-bbs/pull/1114) on) and
-Node.js 22 or later. The mod has no npm dependencies.
+(master from [#1114](https://github.com/NuSkooler/enigma-bbs/pull/1114) on;
+[#1118](https://github.com/NuSkooler/enigma-bbs/pull/1118) or later to see the
+startup warnings described under [Install](#install)) and Node.js 22 or later. The mod has no npm dependencies.
 
 ## Install
 
@@ -33,8 +34,8 @@ Then configure one or both scanners under `fileBase.scanning.scanners` (see belo
 restart ENiGMA½. At startup the log shows `clamd answered PING` for each clamd it can
 reach, and `VirusTotal hash lookup ready` when a `virustotal` entry is configured. If
 clamd cannot be reached, or no clamd is configured and none is found, or an option is
-invalid, you get a `File scanner failed to initialize` warning saying why. Startup
-carries on regardless, and files are held until clamd is back (see
+invalid, you get a `File scanner reported a problem` warning saying why, one per
+problem. Startup carries on regardless, and files are held until clamd is back (see
 [onError](#when-a-scanner-fails)).
 
 `oputil fb scan AREA --virus-scan` uses these scanners too: it loads them through the

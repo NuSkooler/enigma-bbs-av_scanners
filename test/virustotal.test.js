@@ -792,13 +792,17 @@ describe('virustotal scanner', function () {
 
     describe('init', () => {
         it('reports an entry with no usable key, without a request', done => {
-            make().init([options(), options({ apiKey: '@environment:NOPE' })], err => {
-                assert.ok(err);
-                assert.match(err.message, /no usable apiKey/);
-                assert.ok(!err.message.includes(API_KEY));
-                assert.strictEqual(fake.requests.length, 0);
-                done();
-            });
+            make().init(
+                [options(), options({ apiKey: '@environment:NOPE' })],
+                (err, info) => {
+                    assert.ifError(err);
+                    const m = info.warnings.join('\n');
+                    assert.match(m, /no usable apiKey/);
+                    assert.ok(!m.includes(API_KEY));
+                    assert.strictEqual(fake.requests.length, 0);
+                    done();
+                }
+            );
         });
 
         it('warns about invalid and implausible options, keeping strict defaults', done => {
@@ -813,9 +817,9 @@ describe('virustotal scanner', function () {
                     options({ minDetections: 200 }),
                     options({ minDetections: true }),
                 ],
-                err => {
-                    assert.ok(err);
-                    const m = err.message;
+                (err, info) => {
+                    assert.ifError(err);
+                    const m = info.warnings.join('\n');
                     assert.match(
                         m,
                         /entry 1: "minDetections" must be a number of at least 1; using 2/
@@ -843,8 +847,9 @@ describe('virustotal scanner', function () {
         });
 
         it('is request-free with good keys', done => {
-            make().init([options()], err => {
+            make().init([options()], (err, info) => {
                 assert.ifError(err);
+                assert.strictEqual(info, undefined);
                 assert.strictEqual(fake.requests.length, 0);
                 assert.strictEqual(logLines.length, 1);
                 done();

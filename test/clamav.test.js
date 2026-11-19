@@ -239,11 +239,11 @@ describe('clamav: no implicit TCP fallback (squatting 127.0.0.1:3310)', () => {
     it('init says so, clearly, when no clamd is configured or found', done => {
         clamav
             .createClamAvScanner({ socketPaths: [path.join(dir, 'none.ctl')] })
-            .init([{ scanner: 'clamav' }, { scanner: 'clamav' }], err => {
-                assert.ok(err);
-                assert.match(err.message, /^clamav: No clamd socket found at /);
+            .init([{ scanner: 'clamav' }, { scanner: 'clamav' }], (err, info) => {
+                assert.ifError(err);
                 //  once, not once per entry
-                assert.strictEqual(err.message.split('No clamd socket').length, 2);
+                assert.strictEqual(info.warnings.length, 1);
+                assert.match(info.warnings[0], /^No clamd socket found at /);
                 done();
             });
     });
@@ -595,8 +595,9 @@ describe('clamav init', () => {
                     { scanner: 'clamav', socket: where.path },
                     { scanner: 'clamav', socket: where.path },
                 ],
-                err => {
+                (err, info) => {
                     assert.ifError(err);
+                    assert.strictEqual(info, undefined);
                     const pings = fake.sessions.filter(s => 'zPING' === s.command);
                     assert.strictEqual(pings.length, 1);
                     assert.strictEqual(lines.length, 1);
@@ -659,22 +660,20 @@ describe('clamav init', () => {
         }
     });
 
-    it('reports (does not throw) an unreachable clamd', async () => {
+    it('warns about (does not fail on, or throw for) an unreachable clamd', async () => {
         const port = await freePort();
-        const err = await new Promise(resolve =>
+        const [err, info] = await new Promise(resolve =>
             clamav.createClamAvScanner({ initTimeoutMs: 1000 }).init(
                 [
                     { host: '127.0.0.1', port },
                     { socket: '/x', port: 1 },
                 ],
-                resolve
+                (e, i) => resolve([e, i])
             )
         );
-        assert.ok(err);
-        assert.match(
-            err.message,
-            /did not answer PING \(Connection failed \(ECONNREFUSED\)\)/
-        );
-        assert.match(err.message, /not both/);
+        assert.ifError(err);
+        const all = info.warnings.join('\n');
+        assert.match(all, /did not answer PING \(Connection failed \(ECONNREFUSED\)\)/);
+        assert.match(all, /not both/);
     });
 });
