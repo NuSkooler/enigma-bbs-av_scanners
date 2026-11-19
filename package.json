@@ -1,0 +1,40 @@
+{
+    "name": "enigma-bbs-av_scanners",
+    "version": "0.1.0",
+    "description": "ClamAV (clamd) and VirusTotal hash lookup file scanners for ENiGMA½ BBS",
+    "main": "av_scanners.js",
+    "private": true,
+    "license": "BSD-2-Clause",
+    "author": "Bryan D. Ashby",
+    "engines": {
+        "node": ">=22"
+    },
+    "files": [
+        "av_scanners.js",
+        "lib/",
+        "LICENSE",
+        "README.md"
+    ],
+    "scripts": {
+        "test": "mocha --timeout 10000 --exit 'test/**/*.test.js'",
+        "lint": "eslint .",
+        "pretty": "prettier --write .",
+        "pretty:check": "prettier --check ."
+    },
+    "keywords": [
+        "enigma-bbs",
+        "bbs",
+        "clamav",
+        "clamd",
+        "virustotal",
+        "antivirus"
+    ],
+    "devDependencies": {
+        "@eslint/js": "^9.39.5",
+        "eslint": "^9.39.5",
+        "eslint-config-prettier": "^10.1.8",
+        "globals": "^16.5.0",
+        "mocha": "^12.0.3",
+        "prettier": "^3.10.1"
+    }
+}
