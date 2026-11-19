@@ -543,10 +543,19 @@ describe('virustotal scanner', function () {
             });
         });
 
-        it('is quiet and request-free with good keys', done => {
+        it('is request-free with good keys', done => {
             make().init([options()], err => {
                 assert.ifError(err);
                 assert.strictEqual(fake.requests.length, 0);
+                assert.strictEqual(logLines.length, 1);
+                done();
+            });
+        });
+
+        it('says nothing when no entry uses it', done => {
+            make().init([], err => {
+                assert.ifError(err);
+                assert.strictEqual(logLines.length, 0);
                 done();
             });
         });
